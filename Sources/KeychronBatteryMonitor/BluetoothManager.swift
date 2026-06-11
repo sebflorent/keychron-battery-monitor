@@ -6,16 +6,14 @@ import IOKit.hid
 // MARK: - Models
 
 struct BluetoothDevice: Identifiable, Equatable {
-    let id: String          // MAC address
+    let id: String          // MAC address (e.g. "dc-2c-26-fd-2a-22")
     let name: String
-    let batteryLevel: Int?  // 0-100, nil if not reported
+    let batteryLevel: Int?  // 0-100, nil until first HID report received
     let isConnected: Bool
     let lastUpdated: Date
     var customName: String?
 
-    var displayName: String {
-        customName ?? name
-    }
+    var displayName: String { customName ?? name }
 
     var batteryIcon: String {
         guard let level = batteryLevel else { return "battery.0" }
@@ -27,15 +25,6 @@ struct BluetoothDevice: Identifiable, Equatable {
         default: return "battery.0"
         }
     }
-
-    var batteryColor: String {
-        guard let level = batteryLevel else { return "secondary" }
-        switch level {
-        case 20...: return "green"
-        case 10..<20: return "yellow"
-        default: return "red"
-        }
-    }
 }
 
 // MARK: - BluetoothManager
@@ -45,154 +34,165 @@ final class BluetoothManager: ObservableObject {
     static let shared = BluetoothManager()
 
     @Published var devices: [BluetoothDevice] = []
-    @Published var isRefreshing = false
     @Published var lastRefresh: Date?
-
-    private var timer: Timer?
-    private var customNames: [String: String] = [:]
 
     var refreshInterval: TimeInterval {
         get { UserDefaults.standard.double(forKey: "refreshInterval").nonZero ?? 60 }
         set { UserDefaults.standard.set(newValue, forKey: "refreshInterval") }
     }
 
-    private init() {
-        loadCustomNames()
-        startMonitoring()
+    // Battery cache persisted across launches: normalised MAC → (level, date)
+    private var batteryCache: [String: CachedBattery] = [:]
+    // Maps raw IOHIDDeviceRef pointer → normalised MAC for use inside C callbacks
+    private var hidDeviceMap: [UInt: String] = [:]
+
+    private var hidManager: IOHIDManager?
+    private var timer: Timer?
+    private var customNames: [String: String] = [:]
+
+    private struct CachedBattery: Codable {
+        var level: Int
+        var date: Date
     }
 
-    // MARK: - Monitoring
+    private init() {
+        loadCustomNames()
+        loadBatteryCache()
+        setupHIDListener()
+        refreshDeviceList()
+        startTimer()
+    }
+
+    // MARK: - Timer / Device List
 
     func startMonitoring() {
-        timer?.invalidate()
-        refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
-            self?.refresh()
-        }
+        startTimer()
+        refreshDeviceList()
     }
 
     func restartMonitoring() {
-        startMonitoring()
+        timer?.invalidate()
+        startTimer()
     }
 
     @objc func refresh() {
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            guard let self else { return }
-            let updated = self.readBluetoothDevices()
-            DispatchQueue.main.async {
-                self.isRefreshing = false
-                self.devices = updated
-                self.lastRefresh = Date()
-                BatteryHistoryStore.shared.record(devices: updated)
-                NotificationManager.shared.checkThresholds(devices: updated)
-            }
+        refreshDeviceList()
+    }
+
+    private func startTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+            self?.refreshDeviceList()
         }
     }
 
-    // MARK: - Device Discovery
+    private func refreshDeviceList() {
+        guard let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else { return }
 
-    private func readBluetoothDevices() -> [BluetoothDevice] {
-        guard let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else {
-            return []
-        }
-
-        // Build a battery map from IOKit HID layer (one pass for all devices)
-        let batteryMap = readAllHIDBatteryLevels()
-
-        return paired
+        let updated: [BluetoothDevice] = paired
             .filter { $0.isConnected() }
             .compactMap { device -> BluetoothDevice? in
-                guard let address = device.addressString,
-                      let name = device.name else { return nil }
-
-                let battery = batteryMap[normalizeAddress(address)]
-
+                guard let address = device.addressString, let name = device.name else { return nil }
+                let key = normalise(address)
+                let battery = batteryCache[key]?.level
                 return BluetoothDevice(
                     id: address,
                     name: name,
                     batteryLevel: battery,
                     isConnected: true,
-                    lastUpdated: Date(),
+                    lastUpdated: batteryCache[key]?.date ?? Date(),
                     customName: customNames[address]
                 )
             }
+
+        DispatchQueue.main.async {
+            self.devices = updated
+            self.lastRefresh = Date()
+            BatteryHistoryStore.shared.record(devices: updated)
+            NotificationManager.shared.checkThresholds(devices: updated)
+        }
     }
 
-    // MARK: - IOKit HID Battery Reading
+    // MARK: - HID Listener (event-driven battery reading)
+    //
+    // The Keychron K2 sends HID Report ID 3 (Usage Page 0x06 / Battery Strength)
+    // once when it connects, then whenever battery changes.
+    // We listen persistently on the main run loop so we never miss a report.
 
-    /// Enumerates all connected IOKit HID devices via Bluetooth and returns a map of
-    /// normalised MAC address → battery percentage.
-    private func readAllHIDBatteryLevels() -> [String: Int] {
-        var result: [String: Int] = [:]
-
+    private func setupHIDListener() {
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        IOHIDManagerSetDeviceMatching(manager, nil)  // match all HID devices
+        IOHIDManagerSetDeviceMatching(manager, nil)
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
 
-        guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
-            return result
-        }
-        defer { IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
+        buildDeviceMap(manager)
 
-        guard let cfDevices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
-            return result
-        }
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
-        for hidDevice in cfDevices {
-            // Only Bluetooth devices
-            guard let transport = IOHIDDeviceGetProperty(hidDevice, kIOHIDTransportKey as CFString) as? String,
-                  transport.lowercased().contains("bluetooth") else { continue }
+        // Keep map current as devices connect / disconnect
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, { ctx, _, _, _ in
+            guard let ctx else { return }
+            let mgr = Unmanaged<BluetoothManager>.fromOpaque(ctx).takeUnretainedValue()
+            if let hm = mgr.hidManager { mgr.buildDeviceMap(hm) }
+        }, selfPtr)
 
-            // Try all known battery property keys
-            let level = batteryPercent(from: hidDevice)
-            guard let level else { continue }
+        // Listen for Report ID 3 = battery strength (0–100)
+        IOHIDManagerRegisterInputReportCallback(manager, { ctx, _, sender, _, reportID, report, reportLen in
+            guard reportID == 3, reportLen >= 1, let ctx, let sender else { return }
+            let level = Int(report[0])
+            guard level >= 0, level <= 100 else { return }
 
-            // Match address: serial number on BT keyboards is typically the MAC address
-            let serial = (IOHIDDeviceGetProperty(hidDevice, kIOHIDSerialNumberKey as CFString) as? String) ?? ""
-            let product = (IOHIDDeviceGetProperty(hidDevice, kIOHIDProductKey as CFString) as? String) ?? ""
+            let self_ = Unmanaged<BluetoothManager>.fromOpaque(ctx).takeUnretainedValue()
+            let senderKey = UInt(bitPattern: sender)
 
-            let key = normalizeAddress(serial)
-            if !key.isEmpty {
-                result[key] = level
-            } else if !product.isEmpty {
-                // Fallback: store by product name for later matching
-                result["name:\(product.lowercased())"] = level
-            }
-        }
-
-        return result
-    }
-
-    private func batteryPercent(from device: IOHIDDevice) -> Int? {
-        // Keys used by different keyboard firmware implementations
-        let keys = [
-            "BatteryPercent",
-            "Battery Level",
-            "BatteryLevel"
-        ]
-        for key in keys {
-            if let value = IOHIDDeviceGetProperty(device, key as CFString) as? Int,
-               value >= 0, value <= 100 {
-                return value
-            }
-        }
-
-        // Some devices report via IORegistry node property
-        let serviceEntry = IOHIDDeviceGetService(device)
-        defer { IOObjectRelease(serviceEntry) }
-
-        if serviceEntry != IO_OBJECT_NULL {
-            var props: Unmanaged<CFMutableDictionary>?
-            if IORegistryEntryCreateCFProperties(serviceEntry, &props, kCFAllocatorDefault, 0) == kIOReturnSuccess,
-               let dict = props?.takeRetainedValue() as? [String: Any] {
-                for key in keys {
-                    if let value = dict[key] as? Int, value >= 0, value <= 100 {
-                        return value
-                    }
+            DispatchQueue.main.async {
+                if let serial = self_.hidDeviceMap[senderKey] {
+                    self_.storeBattery(level, forNormalisedKey: serial)
                 }
             }
-        }
+        }, selfPtr)
 
-        return nil
+        hidManager = manager
+    }
+
+    private func buildDeviceMap(_ manager: IOHIDManager) {
+        guard let cfDevices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return }
+        for device in cfDevices {
+            guard let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String,
+                  transport.lowercased().contains("bluetooth"),
+                  let serial = IOHIDDeviceGetProperty(device, kIOHIDSerialNumberKey as CFString) as? String,
+                  !serial.isEmpty else { continue }
+
+            let ptr = UInt(bitPattern: Unmanaged.passUnretained(device as AnyObject).toOpaque())
+            hidDeviceMap[ptr] = normalise(serial)
+        }
+    }
+
+    private func storeBattery(_ level: Int, forNormalisedKey key: String) {
+        batteryCache[key] = CachedBattery(level: level, date: Date())
+        saveBatteryCache()
+        refreshDeviceList()
+    }
+
+    // MARK: - Battery Cache Persistence
+
+    private var cacheURL: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("KeychronBatteryMonitor/battery_cache.json")
+    }
+
+    private func saveBatteryCache() {
+        guard let data = try? JSONEncoder().encode(batteryCache) else { return }
+        try? data.write(to: cacheURL, options: .atomic)
+    }
+
+    private func loadBatteryCache() {
+        guard let data = try? Data(contentsOf: cacheURL),
+              let decoded = try? JSONDecoder().decode([String: CachedBattery].self, from: data) else { return }
+        // Discard readings older than 24h (stale after a full recharge cycle)
+        let cutoff = Date().addingTimeInterval(-24 * 3600)
+        batteryCache = decoded.filter { $0.value.date > cutoff }
     }
 
     // MARK: - Custom Names
@@ -200,16 +200,7 @@ final class BluetoothManager: ObservableObject {
     func setCustomName(_ name: String?, for deviceID: String) {
         customNames[deviceID] = name?.isEmpty == false ? name : nil
         saveCustomNames()
-        if let idx = devices.firstIndex(where: { $0.id == deviceID }) {
-            devices[idx] = BluetoothDevice(
-                id: devices[idx].id,
-                name: devices[idx].name,
-                batteryLevel: devices[idx].batteryLevel,
-                isConnected: devices[idx].isConnected,
-                lastUpdated: devices[idx].lastUpdated,
-                customName: customNames[deviceID]
-            )
-        }
+        refreshDeviceList()
     }
 
     private func saveCustomNames() {
@@ -222,7 +213,6 @@ final class BluetoothManager: ObservableObject {
 
     // MARK: - Computed
 
-    /// The device with the lowest battery — used for the menu bar icon
     var criticalDevice: BluetoothDevice? {
         devices
             .filter { $0.batteryLevel != nil }
@@ -231,14 +221,14 @@ final class BluetoothManager: ObservableObject {
 
     // MARK: - Helpers
 
-    private func normalizeAddress(_ raw: String) -> String {
-        raw.lowercased()
+    func normalise(_ address: String) -> String {
+        address.lowercased()
             .replacingOccurrences(of: "-", with: ":")
             .trimmingCharacters(in: .whitespaces)
     }
 }
 
-// MARK: - Helpers
+// MARK: -
 
 private extension Double {
     var nonZero: Double? { self == 0 ? nil : self }

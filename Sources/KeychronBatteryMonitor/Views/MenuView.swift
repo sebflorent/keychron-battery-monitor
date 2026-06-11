@@ -34,7 +34,6 @@ struct MenuView: View {
 
             // Actions
             Button {
-                bluetoothManager.isRefreshing = true
                 bluetoothManager.refresh()
             } label: {
                 HStack {
