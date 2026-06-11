@@ -19,6 +19,8 @@ app: build
 	@cp "Info.plist" "$(CONTENTS)/"
 	@# Patch version into Info.plist
 	@/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" "$(CONTENTS)/Info.plist"
+	@# Ad-hoc sign so Gatekeeper shows "unverified developer" instead of "damaged"
+	@codesign --deep --force --sign - "$(APP_BUNDLE)" 2>/dev/null && echo "Signed (ad-hoc)" || echo "Signing skipped"
 	@echo "Built: $(APP_BUNDLE)"
 
 dmg: app

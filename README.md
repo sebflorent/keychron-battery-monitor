@@ -31,7 +31,13 @@ Works with any Bluetooth keyboard or mouse that reports battery level to macOS, 
 
 1. Download the latest `.dmg` from [Releases](https://github.com/your-username/keychron-battery-monitor/releases)
 2. Open the DMG and drag **Keychron Battery Monitor** to `/Applications`
-3. On first launch: right-click → **Open** (required once to bypass Gatekeeper on unsigned builds)
+3. On first launch: right-click → **Open**, then click Open in the dialog
+
+> If macOS says the app is "damaged", run this once in Terminal:
+> ```bash
+> xattr -cr /Applications/KeychronBatteryMonitor.app
+> ```
+> This removes the internet quarantine flag. The app contains no network code and is fully open source.
 
 ### Build from source
 
