@@ -20,6 +20,11 @@ struct MenuView: View {
 
             Divider()
 
+            if bluetoothManager.karabinerMayBlockBattery {
+                karabinerNotice
+                Divider()
+            }
+
             // Devices
             if bluetoothManager.devices.isEmpty {
                 emptyStateView
@@ -86,6 +91,20 @@ struct MenuView: View {
         }
     }
 
+    private var karabinerNotice: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Karabiner Elements detected", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+            Text("Karabiner’s DriverKit driver takes exclusive HID access. This app cannot read the Keychron’s battery over HID while Karabiner is active. Options: disable Karabiner temporarily, exclude the Keychron device in Karabiner, or uninstall the virtual HID driver to restore battery reports.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
     private var emptyStateView: some View {
         VStack(spacing: 6) {
             Image(systemName: "keyboard.slash")
@@ -114,7 +133,7 @@ struct DeviceRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "keyboard")
+            Image(systemName: device.name.lowercased().contains("mouse") || device.name.lowercased().contains("mx master") ? "computermouse" : "keyboard")
                 .foregroundStyle(.secondary)
                 .frame(width: 20)
 

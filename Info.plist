@@ -21,7 +21,7 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>Keychron Battery Monitor reads battery levels from your connected Bluetooth keyboards.</string>
+    <string>Keychron Battery Monitor reads battery levels from Bluetooth keyboards (HID) and from Bluetooth Low Energy accessories (standard Battery service).</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>NSUserNotificationAlertStyle</key>

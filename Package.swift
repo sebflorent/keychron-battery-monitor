@@ -13,7 +13,8 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedFramework("IOBluetooth"),
-                .linkedFramework("IOKit")
+                .linkedFramework("IOKit"),
+                .linkedFramework("CoreBluetooth")
             ]
         )
     ]

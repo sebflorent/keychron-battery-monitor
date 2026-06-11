@@ -35,13 +35,18 @@ final class BluetoothManager: ObservableObject {
 
     @Published var devices: [BluetoothDevice] = []
     @Published var lastRefresh: Date?
+    /// Karabiner Elements (DriverKit) holds exclusive HID access — our HID battery path cannot see the Keychron.
+    @Published var karabinerMayBlockBattery: Bool = false
+
+    private var bleReader: BLEBatteryReader!
+    private var lastBLEScan: Date = .distantPast
 
     var refreshInterval: TimeInterval {
         get { UserDefaults.standard.double(forKey: "refreshInterval").nonZero ?? 60 }
         set { UserDefaults.standard.set(newValue, forKey: "refreshInterval") }
     }
 
-    // Battery cache persisted across launches: normalised MAC → (level, date)
+    // Battery cache: keys are normalised MAC addresses, or "name:<lowercased>" for BLE-only reads (e.g. MX Master).
     private var batteryCache: [String: CachedBattery] = [:]
     // Maps raw IOHIDDeviceRef pointer → normalised MAC for use inside C callbacks
     private var hidDeviceMap: [UInt: String] = [:]
@@ -56,6 +61,7 @@ final class BluetoothManager: ObservableObject {
     }
 
     private init() {
+        bleReader = BLEBatteryReader(owner: self)
         loadCustomNames()
         loadBatteryCache()
         setupHIDListener()
@@ -93,14 +99,16 @@ final class BluetoothManager: ObservableObject {
             .filter { $0.isConnected() }
             .compactMap { device -> BluetoothDevice? in
                 guard let address = device.addressString, let name = device.name else { return nil }
-                let key = normalise(address)
-                let battery = batteryCache[key]?.level
+                let macKey = normalise(address)
+                let nameKey = "name:\(name.lowercased())"
+                let cached = batteryCache[macKey] ?? batteryCache[nameKey]
+                let battery = cached?.level
                 return BluetoothDevice(
                     id: address,
                     name: name,
                     batteryLevel: battery,
                     isConnected: true,
-                    lastUpdated: batteryCache[key]?.date ?? Date(),
+                    lastUpdated: cached?.date ?? Date(),
                     customName: customNames[address]
                 )
             }
@@ -111,6 +119,22 @@ final class BluetoothManager: ObservableObject {
             BatteryHistoryStore.shared.record(devices: updated)
             NotificationManager.shared.checkThresholds(devices: updated)
         }
+
+        let missingBatteryNames = updated.filter { $0.batteryLevel == nil }.map(\.name)
+        if !missingBatteryNames.isEmpty, Date().timeIntervalSince(lastBLEScan) > 45 {
+            lastBLEScan = Date()
+            DispatchQueue.main.async {
+                self.bleReader.refreshIfNeeded(connectedDeviceNames: missingBatteryNames)
+            }
+        }
+    }
+
+    /// Called from `BLEBatteryReader` when GATT Battery Level is read (BLE accessories).
+    func storeBLEBattery(level: Int, peripheralName: String) {
+        let nameKey = "name:\(peripheralName.lowercased())"
+        batteryCache[nameKey] = CachedBattery(level: level, date: Date())
+        saveBatteryCache()
+        refreshDeviceList()
     }
 
     // MARK: - HID Listener (event-driven battery reading)
@@ -125,7 +149,9 @@ final class BluetoothManager: ObservableObject {
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
 
+        hidManager = manager
         buildDeviceMap(manager)
+        detectKarabiner(in: manager)
 
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
@@ -133,10 +159,13 @@ final class BluetoothManager: ObservableObject {
         IOHIDManagerRegisterDeviceMatchingCallback(manager, { ctx, _, _, _ in
             guard let ctx else { return }
             let mgr = Unmanaged<BluetoothManager>.fromOpaque(ctx).takeUnretainedValue()
-            if let hm = mgr.hidManager { mgr.buildDeviceMap(hm) }
+            if let hm = mgr.hidManager {
+                mgr.buildDeviceMap(hm)
+                mgr.detectKarabiner(in: hm)
+            }
         }, selfPtr)
 
-        // Listen for Report ID 3 = battery strength (0–100)
+        // Listen for Report ID 3 = battery strength (0–100) — Keychron K2 firmware over Bluetooth Classic HID
         IOHIDManagerRegisterInputReportCallback(manager, { ctx, _, sender, _, reportID, report, reportLen in
             guard reportID == 3, reportLen >= 1, let ctx, let sender else { return }
             let level = Int(report[0])
@@ -151,8 +180,17 @@ final class BluetoothManager: ObservableObject {
                 }
             }
         }, selfPtr)
+    }
 
-        hidManager = manager
+    private func detectKarabiner(in manager: IOHIDManager) {
+        guard let cfDevices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return }
+        let found = cfDevices.contains { device in
+            let product = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? ""
+            return product.range(of: "Karabiner", options: .caseInsensitive) != nil
+        }
+        DispatchQueue.main.async {
+            self.karabinerMayBlockBattery = found
+        }
     }
 
     private func buildDeviceMap(_ manager: IOHIDManager) {
