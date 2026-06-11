@@ -26,7 +26,11 @@ final class NotificationManager: ObservableObject {
     private var lastNotifiedLevel: [String: Int] = [:]
 
     private init() {
-        checkAuthorization()
+        // Defer authorization check — UNUserNotificationCenter requires a live bundle
+        // and must not be called during static initialisation
+        DispatchQueue.main.async {
+            self.checkAuthorization()
+        }
     }
 
     // MARK: - Authorization
