@@ -30,6 +30,7 @@ Works with any Bluetooth keyboard or mouse that reports battery level to macOS, 
 - **Karabiner Elements** (DriverKit virtual HID): if Karabiner’s driver has exclusive access to your Keychron, macOS will not deliver the keyboard’s HID battery report to this app. The menu shows a warning when Karabiner is detected. Workarounds: temporarily quit Karabiner, exclude the Keychron in Karabiner’s configuration, or use the keyboard without the Karabiner virtual device path.
 - **Bluetooth Low Energy mice** (e.g. Logitech MX Master 3S on BLE): battery is read via the standard BLE Battery service when macOS exposes it; behaviour depends on the vendor stack.
 - **Corporate MDM / Gatekeeper**: unsigned builds may be blocked; use a locally built `.app` or a Developer ID–signed release.
+- **Keychron en mode câble USB** : en USB, le clavier peut ne plus apparaître comme périphérique **Bluetooth** HID ; l’app ne lit que les appareils **connectés en Bluetooth** dans Réglages Système. Passe le K2 en **mode sans fil** (Bluetooth) pour tester.
 
 ## Install
 

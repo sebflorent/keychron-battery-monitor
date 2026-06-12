@@ -40,6 +40,8 @@ final class BluetoothManager: ObservableObject {
 
     private var bleReader: BLEBatteryReader!
     private var lastBLEScan: Date = .distantPast
+    private var lastHIDPoll: Date = .distantPast
+    private var didInitialHIDPoll = false
 
     var refreshInterval: TimeInterval {
         get { UserDefaults.standard.double(forKey: "refreshInterval").nonZero ?? 60 }
@@ -48,8 +50,6 @@ final class BluetoothManager: ObservableObject {
 
     // Battery cache: keys are normalised MAC addresses, or "name:<lowercased>" for BLE-only reads (e.g. MX Master).
     private var batteryCache: [String: CachedBattery] = [:]
-    // Maps raw IOHIDDeviceRef pointer → normalised MAC for use inside C callbacks
-    private var hidDeviceMap: [UInt: String] = [:]
 
     private var hidManager: IOHIDManager?
     private var timer: Timer?
@@ -127,6 +127,19 @@ final class BluetoothManager: ObservableObject {
                 self.bleReader.refreshIfNeeded(connectedDeviceNames: missingBatteryNames)
             }
         }
+
+        // Synchronous HID GetReport poll (Feature/Input) — throttled; also once soon after launch.
+        let pairedMacs = Set(updated.map { normalise($0.id) })
+        let needsBattery = updated.contains { $0.batteryLevel == nil }
+        let throttleOK = Date().timeIntervalSince(lastHIDPoll) > 25
+        let forceInitial = needsBattery && !didInitialHIDPoll
+        if !pairedMacs.isEmpty, needsBattery, throttleOK || forceInitial {
+            if forceInitial { didInitialHIDPoll = true }
+            lastHIDPoll = Date()
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.pollHIDBatteryReports(pairedMacKeys: pairedMacs)
+            }
+        }
     }
 
     /// Called from `BLEBatteryReader` when GATT Battery Level is read (BLE accessories).
@@ -150,36 +163,88 @@ final class BluetoothManager: ObservableObject {
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
 
         hidManager = manager
-        buildDeviceMap(manager)
         detectKarabiner(in: manager)
 
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
-        // Keep map current as devices connect / disconnect
+        // Keep Karabiner detection current as devices connect / disconnect
         IOHIDManagerRegisterDeviceMatchingCallback(manager, { ctx, _, _, _ in
             guard let ctx else { return }
             let mgr = Unmanaged<BluetoothManager>.fromOpaque(ctx).takeUnretainedValue()
             if let hm = mgr.hidManager {
-                mgr.buildDeviceMap(hm)
                 mgr.detectKarabiner(in: hm)
             }
         }, selfPtr)
 
-        // Listen for Report ID 3 = battery strength (0–100) — Keychron K2 firmware over Bluetooth Classic HID
-        IOHIDManagerRegisterInputReportCallback(manager, { ctx, _, sender, _, reportID, report, reportLen in
-            guard reportID == 3, reportLen >= 1, let ctx, let sender else { return }
-            let level = Int(report[0])
-            guard level >= 0, level <= 100 else { return }
-
+        // Input reports (interrupt). Keychron K2: report ID 3, first byte = 0…100 (%).
+        IOHIDManagerRegisterInputReportCallback(manager, { ctx, result, sender, _, reportID, report, reportLen in
+            guard result == kIOReturnSuccess, reportLen >= 1, let ctx, let sender else { return }
             let self_ = Unmanaged<BluetoothManager>.fromOpaque(ctx).takeUnretainedValue()
-            let senderKey = UInt(bitPattern: sender)
+            guard let macKey = self_.macKey(fromHIDSender: sender) else { return }
+
+            let level: Int?
+            if reportID == 3 {
+                level = Int(report[0])
+            } else if reportID == 0, reportLen >= 2, report[0] == 3 {
+                // Some stacks prepend report ID in the buffer
+                level = Int(report[1])
+            } else {
+                level = nil
+            }
+            guard let level, level >= 0, level <= 100 else { return }
 
             DispatchQueue.main.async {
-                if let serial = self_.hidDeviceMap[senderKey] {
-                    self_.storeBattery(level, forNormalisedKey: serial)
-                }
+                self_.storeBattery(level, forNormalisedKey: macKey)
             }
         }, selfPtr)
+    }
+
+    /// Resolve Bluetooth MAC key from an `IOHIDReportCallback` `sender` (IOHIDDeviceRef).
+    private func macKey(fromHIDSender sender: UnsafeMutableRawPointer) -> String? {
+        let device: IOHIDDevice = unsafeBitCast(sender, to: IOHIDDevice.self)
+        guard let serial = IOHIDDeviceGetProperty(device, kIOHIDSerialNumberKey as CFString) as? String,
+              !serial.isEmpty else { return nil }
+        return normalise(serial)
+    }
+
+    /// Try synchronous GetReport for report ID 3 (Keychron battery strength in descriptor).
+    private func pollHIDBatteryReports(pairedMacKeys: Set<String>) {
+        guard let manager = hidManager,
+              let cfDevices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return }
+
+        for device in cfDevices {
+            guard let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String,
+                  transport.lowercased().contains("bluetooth"),
+                  let serial = IOHIDDeviceGetProperty(device, kIOHIDSerialNumberKey as CFString) as? String,
+                  !serial.isEmpty else { continue }
+
+            let macKey = normalise(serial)
+            guard pairedMacKeys.contains(macKey) else { continue }
+
+            let open = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
+            guard open == kIOReturnSuccess || open == kIOReturnExclusiveAccess else { continue }
+            defer { IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone)) }
+
+            for reportType in [kIOHIDReportTypeFeature, kIOHIDReportTypeInput] {
+                var buf = [UInt8](repeating: 0, count: 32)
+                var len = buf.count
+                let gr = IOHIDDeviceGetReport(device, reportType, CFIndex(3), &buf, &len)
+                guard gr == kIOReturnSuccess, len >= 1 else { continue }
+
+                let level: Int?
+                if len >= 2, buf[0] == 3 {
+                    level = Int(buf[1])
+                } else {
+                    level = Int(buf[0])
+                }
+                guard let level, level >= 0, level <= 100 else { continue }
+
+                DispatchQueue.main.async { [weak self] in
+                    self?.storeBattery(level, forNormalisedKey: macKey)
+                }
+                break
+            }
+        }
     }
 
     private func detectKarabiner(in manager: IOHIDManager) {
@@ -190,19 +255,6 @@ final class BluetoothManager: ObservableObject {
         }
         DispatchQueue.main.async {
             self.karabinerMayBlockBattery = found
-        }
-    }
-
-    private func buildDeviceMap(_ manager: IOHIDManager) {
-        guard let cfDevices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return }
-        for device in cfDevices {
-            guard let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String,
-                  transport.lowercased().contains("bluetooth"),
-                  let serial = IOHIDDeviceGetProperty(device, kIOHIDSerialNumberKey as CFString) as? String,
-                  !serial.isEmpty else { continue }
-
-            let ptr = UInt(bitPattern: Unmanaged.passUnretained(device as AnyObject).toOpaque())
-            hidDeviceMap[ptr] = normalise(serial)
         }
     }
 
